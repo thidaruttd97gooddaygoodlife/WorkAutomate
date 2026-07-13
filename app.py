@@ -20,7 +20,7 @@ app = Flask(__name__)
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-2.5-flash')
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 # ================= Webhook Route =================
 @app.route("/callback", methods=['POST'])
@@ -51,6 +51,7 @@ def handle_message(event):
         )
         reply_text = response.text
     except Exception as e:
+        print("Gemini API Error:", e)
         reply_text = "ขออภัยครับ ตอนนี้สมองผมเบลอนิดหน่อย (API Error)"
 
     line_bot_api.reply_message(
