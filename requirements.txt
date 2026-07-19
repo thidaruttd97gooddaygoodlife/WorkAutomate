@@ -6,3 +6,5 @@ gTTS
 mutagen
 feedparser
 gunicorn
+Pillow
+beautifulsoup4

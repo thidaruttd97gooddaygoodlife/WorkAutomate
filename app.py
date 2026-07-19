@@ -1,7 +1,13 @@
 import os
+import io
+import re
+import socket
+import ipaddress
 import threading
+from urllib.parse import urlparse
 import requests
 import feedparser
+from bs4 import BeautifulSoup
 from google import genai
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
@@ -9,6 +15,7 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage, AudioSendMessage
 from gtts import gTTS
 from mutagen.mp3 import MP3
+from PIL import Image, ImageDraw, ImageFont
 
 # ================= Configuration =================
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '')
@@ -53,6 +60,178 @@ def trigger_news():
     threading.Thread(target=send_daily_news, daemon=True).start()
     return "News triggered", 200
 
+# One-off admin action to (re)create and set the LINE Rich Menu (the tappable
+# button bar under the chat). Safe to call again later to change the buttons.
+@app.route("/setup-richmenu", methods=['GET', 'POST'])
+def setup_richmenu():
+    token = request.args.get('token') or request.headers.get('X-Trigger-Token')
+    if not TRIGGER_SECRET or token != TRIGGER_SECRET:
+        abort(403)
+    try:
+        rich_menu_id = _setup_rich_menu()
+        return f"Rich menu created and set as default: {rich_menu_id}", 200
+    except Exception as e:
+        print("Rich menu setup error:", e)
+        return f"Rich menu setup failed: {e}", 500
+
+# ================= Rich Menu Setup =================
+THAI_FONT_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/notosansthai/NotoSansThai%5Bwdth%2Cwght%5D.ttf"
+THAI_FONT_PATH = "/tmp/NotoSansThai.ttf"
+
+def _get_thai_font(size):
+    if not os.path.exists(THAI_FONT_PATH):
+        resp = requests.get(THAI_FONT_URL, timeout=20)
+        resp.raise_for_status()
+        with open(THAI_FONT_PATH, "wb") as f:
+            f.write(resp.content)
+    return ImageFont.truetype(THAI_FONT_PATH, size)
+
+def _draw_centered_text(draw, box, text, font, fill="white"):
+    x0, y0, x1, y1 = box
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    x = x0 + ((x1 - x0) - text_w) / 2 - bbox[0]
+    y = y0 + ((y1 - y0) - text_h) / 2 - bbox[1]
+    draw.text((x, y), text, font=font, fill=fill)
+
+def _build_richmenu_image():
+    width, height = 2500, 843
+    image = Image.new("RGB", (width, height), "#ffffff")
+    draw = ImageDraw.Draw(image)
+    font = _get_thai_font(90)
+
+    # No emoji here: the Thai font has no emoji glyphs and they'd render as tofu boxes
+    draw.rectangle([0, 0, width // 2, height], fill="#4A6CF7")
+    draw.rectangle([width // 2, 0, width, height], fill="#22A06B")
+    _draw_centered_text(draw, (0, 0, width // 2, height), "สรุปข่าว AI", font)
+    _draw_centered_text(draw, (width // 2, 0, width, height), "วิธีใช้งาน", font)
+
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+def _setup_rich_menu():
+    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+
+    # Remove any existing rich menus so re-running this doesn't pile up orphans
+    existing = requests.get("https://api.line.me/v2/bot/richmenu/list", headers=headers, timeout=20).json()
+    for menu in existing.get("richmenus", []):
+        requests.delete(f"https://api.line.me/v2/bot/richmenu/{menu['richMenuId']}", headers=headers, timeout=20)
+
+    richmenu_payload = {
+        "size": {"width": 2500, "height": 843},
+        "selected": True,
+        "name": "main-menu",
+        "chatBarText": "เมนู",
+        "areas": [
+            {
+                "bounds": {"x": 0, "y": 0, "width": 1250, "height": 843},
+                "action": {"type": "message", "text": "สรุปข่าว AI ตอนนี้"}
+            },
+            {
+                "bounds": {"x": 1250, "y": 0, "width": 1250, "height": 843},
+                "action": {"type": "message", "text": "วิธีใช้งาน"}
+            }
+        ]
+    }
+    create_resp = requests.post(
+        "https://api.line.me/v2/bot/richmenu",
+        headers={**headers, "Content-Type": "application/json"},
+        json=richmenu_payload,
+        timeout=20,
+    )
+    create_resp.raise_for_status()
+    rich_menu_id = create_resp.json()["richMenuId"]
+
+    image_bytes = _build_richmenu_image()
+    upload_resp = requests.post(
+        f"https://api-data.line.biz/v2/bot/richmenu/{rich_menu_id}/content",
+        headers={**headers, "Content-Type": "image/png"},
+        data=image_bytes,
+        timeout=30,
+    )
+    upload_resp.raise_for_status()
+
+    default_resp = requests.post(
+        f"https://api.line.me/v2/bot/user/all/richmenu/{rich_menu_id}",
+        headers=headers,
+        timeout=20,
+    )
+    default_resp.raise_for_status()
+
+    return rich_menu_id
+
+HELP_TEXT = """สวัสดีครับ ผม Amazing Assistant ผู้ช่วย AI ครับ
+
+สิ่งที่ผมทำได้ตอนนี้:
+📌 พิมพ์คำถามอะไรก็ได้ ผมจะตอบให้ครับ
+📌 ส่งลิงก์บทความมา ผมเข้าไปอ่านแล้วสรุปให้ได้เลย (ยังไม่รองรับรูปภาพหรือไฟล์นะครับ)
+📌 กดปุ่ม "สรุปข่าว AI" ที่เมนูด้านล่างแชท เพื่อดูสรุปข่าว AI ล่าสุดทั้งไทยและต่างประเทศ แยกหมวดหมู่ พร้อมที่มา
+📌 ทุกวัน 08:00 / 12:00 / 18:00 ผมจะส่งสรุปข่าว AI ให้อัตโนมัติครับ"""
+
+PERSONA_PROMPT = (
+    "คุณคือ Amazing Assistant ผู้ช่วย AI เพศชาย พูดจาแบบเพื่อนสนิทที่รู้ใจ กึ่งทางการ ไม่ต้องเนี๊ยบจนแข็งทื่อ "
+    "แต่เป็นคนมีความรู้ ทันโลก อธิบายให้เห็นภาพเข้าใจง่าย และให้คำแนะนำที่เป็นประโยชน์เสมอ "
+    'ตอบเป็นภาษาไทย ลงท้ายประโยคด้วย "ครับ" เท่านั้น ห้ามใช้ "ค่ะ" หรือ "นะคะ" เด็ดขาด '
+    "ห้ามใช้ Markdown เช่น **ตัวหนา**, ## หัวข้อ, เครื่องหมายขีด - เพราะ LINE ไม่รองรับการแสดงผล Markdown "
+    "ให้จัดรูปแบบคำตอบด้วยการขึ้นบรรทัดใหม่และอีโมจิที่เหมาะสมแทน เพื่อให้อ่านง่ายและสวยงาม"
+)
+
+URL_PATTERN = re.compile(r'https?://\S+')
+
+def _is_safe_url(url):
+    """Blocks fetching internal/private network addresses (SSRF guard)."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return False
+        ip = socket.gethostbyname(parsed.hostname)
+        addr = ipaddress.ip_address(ip)
+        return not (addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_multicast)
+    except Exception:
+        return False
+
+def _fetch_url_text(url, max_chars=6000):
+    if not _is_safe_url(url):
+        return ""
+    resp = requests.get(
+        url,
+        timeout=15,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; AmazingAssistantBot/1.0)"}
+    )
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for tag in soup(["script", "style", "nav", "header", "footer", "noscript"]):
+        tag.decompose()
+    lines = [line.strip() for line in soup.get_text(separator="\n").splitlines() if line.strip()]
+    return "\n".join(lines)[:max_chars]
+
+def _generate_reply(user_text):
+    url_match = URL_PATTERN.search(user_text)
+    try:
+        if url_match:
+            url = url_match.group(0)
+            try:
+                page_text = _fetch_url_text(url)
+            except Exception as e:
+                print("URL fetch error:", e)
+                page_text = ""
+
+            if not page_text:
+                return "ขออภัยครับ ผมเข้าไปอ่านลิงก์นี้ไม่ได้ (เว็บอาจบล็อกบอทหรือต้องล็อกอิน) ลองก๊อปเนื้อหามาวางให้ผมอ่านแทนได้ไหมครับ"
+
+            question = user_text.replace(url, "").strip()
+            ask = f"คำถามของผู้ใช้: {question}" if question else "ช่วยสรุปประเด็นสำคัญของเนื้อหานี้ให้เข้าใจง่ายและเห็นภาพหน่อยครับ"
+            prompt = f"{PERSONA_PROMPT}\n\nเนื้อหาจากลิงก์ที่ผู้ใช้ส่งมา:\n{page_text}\n\n{ask}"
+        else:
+            prompt = f"{PERSONA_PROMPT}\n\nข้อความจากผู้ใช้: {user_text}"
+
+        response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
+        return response.text
+    except Exception as e:
+        print("Gemini API Error:", e)
+        return f"ขออภัยครับ เกิดข้อผิดพลาด: {str(e)[:100]}"
+
 # ================= Bot Reply Logic =================
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
@@ -64,21 +243,13 @@ def handle_message(event):
         threading.Thread(target=send_daily_news, daemon=True).start()
         return
 
-    # Normal AI Chat
-    try:
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=f"คุณคือผู้ช่วย AI ชื่อ Amazing Assistant ตอบเป็นภาษาไทย เป็นกันเอง สั้นกระชับ และเป็นประโยชน์: {user_text}"
-        )
-        reply_text = response.text
-    except Exception as e:
-        print("Gemini API Error:", e)
-        reply_text = f"ขออภัยครับ เกิดข้อผิดพลาด: {str(e)[:100]}"
+    # Rich Menu: วิธีใช้งาน
+    if user_text == "วิธีใช้งาน":
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=HELP_TEXT))
+        return
 
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=reply_text)
-    )
+    reply_text = _generate_reply(user_text)
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
 
 # ================= News Fetching =================
 NEWS_CATEGORIES = ["เครื่องมือใหม่", "ข่าวธุรกิจ", "เทคโนโลยี", "อัปเดตโมเดล"]
@@ -122,6 +293,7 @@ index::หมวดหมู่::คำอธิบายง่ายๆ 2-3 ป
 
 - index ต้องตรงกับตัวเลขในลิสต์ด้านบนเป๊ะๆ
 - หมวดหมู่ ให้เลือกจาก: {", ".join(NEWS_CATEGORIES)}
+- น้ำเสียงคำอธิบายเหมือนเพื่อนที่รู้ใจเล่าข่าวให้ฟัง กึ่งทางการ เห็นภาพ เข้าใจง่าย ไม่ต้องเนี๊ยบจนแข็งทื่อ
 - ห้ามใส่เครื่องหมาย :: ซ้ำภายในข้อความอธิบาย"""
 
     response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
@@ -188,6 +360,22 @@ def text_to_speech_and_upload(text):
         print("TTS Error:", e)
     return None, None
 
+# LINE rejects any single text message over 5000 characters
+def _chunk_message(text, limit=4900):
+    chunks = []
+    current = ""
+    for section in text.split("\n\n"):
+        candidate = f"{current}\n\n{section}" if current else section
+        if len(candidate) > limit:
+            if current:
+                chunks.append(current)
+            current = section[:limit]
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
 # ================= Send Daily News =================
 def send_daily_news():
     print("Fetching and sending AI news...")
@@ -195,7 +383,9 @@ def send_daily_news():
         summary, speech_text = fetch_ai_news()
         audio_url, duration_ms = text_to_speech_and_upload(speech_text)
 
-        messages = [TextSendMessage(text="🤖 ข่าว AI ประจำรอบ\n\n" + summary)]
+        chunks = _chunk_message("🤖 ข่าว AI ประจำรอบ\n\n" + summary)
+        # LINE allows at most 5 messages per push; leave room for the audio message
+        messages = [TextSendMessage(text=chunk) for chunk in chunks[:4]]
 
         if audio_url and duration_ms:
             messages.append(AudioSendMessage(
