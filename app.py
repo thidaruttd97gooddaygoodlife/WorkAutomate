@@ -1,4 +1,5 @@
 import os
+import threading
 import requests
 import feedparser
 from google import genai
@@ -46,7 +47,10 @@ def trigger_news():
     token = request.args.get('token') or request.headers.get('X-Trigger-Token')
     if not TRIGGER_SECRET or token != TRIGGER_SECRET:
         abort(403)
-    send_daily_news()
+    # Run in the background and respond immediately: the full pipeline (RSS x2 +
+    # Gemini + TTS + upload + LINE push) can take longer than gunicorn's default
+    # worker timeout, which was killing the request before it could respond.
+    threading.Thread(target=send_daily_news, daemon=True).start()
     return "News triggered", 200
 
 # ================= Bot Reply Logic =================
@@ -57,7 +61,7 @@ def handle_message(event):
     # Rich Menu: สรุปข่าว AI
     if user_text == "สรุปข่าว AI ตอนนี้":
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="กำลังรวบรวมข่าว AI ให้ครับ รอสักครู่... 🤖"))
-        send_daily_news()
+        threading.Thread(target=send_daily_news, daemon=True).start()
         return
 
     # Normal AI Chat
